@@ -1,13 +1,30 @@
-// Package upstream 封装 TRAE SOLO 签到、积分查询、Token 刷新等上游 API。
+// Package upstream 封装 TRAE 签到、积分查询、Token 刷新等上游 API。
+//
+// 2026-11-18 起 TRAE 账号并入豆包飞书账号体系，登录/刷新接口发生变化：
+//   - 登录改为豆包 SSO（PKCE + AuthCode），不再直接返回 refreshToken；
+//   - ExchangeToken 升级到 v3，refresh 时需要设备密钥对签名（DeviceProof）；
+//   - 统一宿主从 api.trae.com.cn 迁到 api.trae.cn。
+//
+// 签到/积分接口（/trae/api/v2/ug/...）本身未变，仍使用 Cloud-IDE-JWT。
 package upstream
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,16 +32,27 @@ import (
 )
 
 const (
-	UgHost         = "https://api.trae.cn"
-	OAuthHost      = "https://api.trae.com.cn"
-	ClientID       = "en1oxy7wnw8j9n"
-	IdeVersion     = "0.1.43"
-	IdeVersionCode = "20260716"
+	// AuthHost 豆包账号融合后的统一宿主（ExchangeToken / GetUserInfo）。
+	AuthHost = "https://api.trae.cn"
+	// LegacyAuthHost 旧的 iCube 账号宿主，仅用于兼容旧凭证。
+	LegacyAuthHost = "https://api.trae.com.cn"
+	// UgHost 签到/积分接口宿主（未变）。
+	UgHost = "https://api.trae.cn"
 
-	EpExchange      = "/cloudide/api/v3/trae/oauth/ExchangeToken"
-	EpCheckinStatus = "/trae/api/v2/ug/checkin_credits/status"
-	EpCheckinClaim  = "/trae/api/v2/ug/checkin_credits/claim"
-	EpEntUsage      = "/trae/api/v2/pay/ide_user_ent_usage"
+	// ClientIDTrae 新版 TRAE 客户端 ID（authConfig.TRAE.stable）。
+	ClientIDTrae = "ono9krqynydwx5"
+	// ClientIDSolo 旧 SOLO 客户端 ID（authConfig.SOLO.stable），旧凭证兜底用。
+	ClientIDSolo = "en1oxy7wnw8j9n"
+
+	IdeVersion     = "1.107.1"
+	IdeVersionCode = "20261125"
+
+	EpExchangeV3     = "/trae/api/v3/oauth/ExchangeToken"
+	EpExchangeLegacy = "/cloudide/api/v3/trae/oauth/ExchangeToken"
+	EpGetUserInfo    = "/cloudide/api/v3/trae/GetUserInfo"
+	EpCheckinStatus  = "/trae/api/v2/ug/checkin_credits/status"
+	EpCheckinClaim   = "/trae/api/v2/ug/checkin_credits/claim"
+	EpEntUsage       = "/trae/api/v2/pay/ide_user_ent_usage"
 )
 
 var clientUA = "Trae/" + IdeVersion
@@ -57,64 +85,357 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	return raw, nil
 }
 
-// RefreshToken 通过 ExchangeToken 强制刷新 access token。
+// TokenResult 统一的换 token 结果（v3 / legacy 共用）。
+type TokenResult struct {
+	Token        string
+	RefreshToken string
+	ExpiresAt    int64 // Unix 秒
+}
+
+type tokenPayload struct {
+	Token               string          `json:"Token"`
+	RefreshToken        string          `json:"RefreshToken"`
+	TokenExpireAt       json.RawMessage `json:"TokenExpireAt"`
+	TokenExpireDuration int64           `json:"TokenExpireDuration"`
+}
+
+// parseTokenPayload 解析 Result / Data 中的 token 字段。
+// TokenExpireAt 可能是时间戳、毫秒时间戳或 RFC3339 字符串。
+func parseTokenPayload(p tokenPayload) *TokenResult {
+	exp := parseTimeValue(p.TokenExpireAt)
+	if exp == 0 && p.TokenExpireDuration > 0 {
+		exp = time.Now().Unix() + p.TokenExpireDuration
+	}
+	return &TokenResult{Token: p.Token, RefreshToken: p.RefreshToken, ExpiresAt: exp}
+}
+
+func parseTimeValue(raw json.RawMessage) int64 {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0
+	}
+	var n json.Number
+	if err := json.Unmarshal(raw, &n); err == nil {
+		v, err := n.Int64()
+		if err != nil {
+			f, ferr := n.Float64()
+			if ferr != nil {
+				return 0
+			}
+			v = int64(f)
+		}
+		if v > 1e12 { // 毫秒
+			v /= 1000
+		}
+		return v
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil && s != "" {
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			return t.Unix()
+		}
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+			if v > 1e12 {
+				v /= 1000
+			}
+			return v
+		}
+	}
+	return 0
+}
+
+func clientIDFor(a *auth.Auth) string {
+	if strings.TrimSpace(a.ClientID) != "" {
+		return a.ClientID
+	}
+	if strings.TrimSpace(a.DevicePrivateKey) != "" {
+		return ClientIDTrae
+	}
+	return ClientIDSolo
+}
+
+func platformCode(clientID string) string {
+	if clientID == ClientIDSolo {
+		return "SOLO_PC"
+	}
+	return "IDE_PC"
+}
+
+// deviceInfo 构造 v3 ExchangeToken 需要的设备信息（与官方客户端一致）。
+func deviceInfo(a *auth.Auth, clientID string) map[string]any {
+	host, _ := os.Hostname()
+	return map[string]any{
+		"DeviceID":        a.DeviceID,
+		"MachineID":       a.MachineID,
+		"PlatformCode":    platformCode(clientID),
+		"DeviceType":      "PC",
+		"DeviceName":      host,
+		"DeviceModel":     "PC",
+		"ClientVersion":   IdeVersion,
+		"DevicePublicKey": a.DevicePublicKey,
+		"DeviceBrand":     osBrand(),
+		"DeviceCPU":       runtime.GOARCH,
+		"OSInfo":          osBrand(),
+		"OSVersion":       osVersion(),
+	}
+}
+
+func osBrand() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "Windows"
+	case "darwin":
+		return "macOS"
+	default:
+		return "Linux"
+	}
+}
+
+func osVersion() string {
+	if runtime.GOOS == "windows" {
+		return "10.0.22631"
+	}
+	if v := os.Getenv("OSTYPE"); v != "" {
+		return v
+	}
+	return runtime.GOOS
+}
+
+// signDeviceProof 用设备私钥对请求签名：
+// ECDSA(P-256, SHA256) over "METHOD\nPATH\nClientID\nRefreshToken\nTimestamp\nNonce"。
+func signDeviceProof(privPEM, method, path, clientID, refreshToken string) (sig string, ts int64, nonce string, err error) {
+	block, _ := pem.Decode([]byte(privPEM))
+	if block == nil {
+		return "", 0, "", fmt.Errorf("device private key: invalid PEM")
+	}
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return "", 0, "", fmt.Errorf("device private key: %w", err)
+	}
+	ecKey, ok := key.(*ecdsa.PrivateKey)
+	if !ok {
+		return "", 0, "", fmt.Errorf("device private key: not ECDSA")
+	}
+	ts = time.Now().Unix()
+	nb := make([]byte, 16)
+	if _, err := rand.Read(nb); err != nil {
+		return "", 0, "", err
+	}
+	nonce = hex.EncodeToString(nb)
+	msg := strings.Join([]string{method, path, clientID, refreshToken, strconv.FormatInt(ts, 10), nonce}, "\n")
+	digest := sha256.Sum256([]byte(msg))
+	der, err := ecdsa.SignASN1(rand.Reader, ecKey, digest[:])
+	if err != nil {
+		return "", 0, "", err
+	}
+	return base64.StdEncoding.EncodeToString(der), ts, nonce, nil
+}
+
+func (c *Client) postExchange(host string, body map[string]any, token string) (*TokenResult, error) {
+	raw, _ := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost, host+EpExchangeV3, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("x-cloudide-token", token)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Result *tokenPayload `json:"Result"`
+		Data   *tokenPayload `json:"Data"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("exchange parse: %w", err)
+	}
+	p := resp.Result
+	if p == nil {
+		p = resp.Data
+	}
+	if p == nil || p.Token == "" {
+		return nil, fmt.Errorf("refresh_failed: %s — re-login required", truncate(string(data), 200))
+	}
+	return parseTokenPayload(*p), nil
+}
+
+// ExchangeAuthCode 用豆包 SSO 回调里的 AuthCode + PKCE verifier 换取 token。
+func (c *Client) ExchangeAuthCode(a *auth.Auth, authCode, codeVerifier string) (*TokenResult, error) {
+	clientID := clientIDFor(a)
+	body := map[string]any{
+		"ClientID":     clientID,
+		"ClientSecret": "",
+		"AuthCode":     authCode,
+		"CodeVerifier": codeVerifier,
+		"DeviceInfo":   deviceInfo(a, clientID),
+		"IDEVersion":   IdeVersion,
+	}
+	return c.postExchange(AuthHost, body, "")
+}
+
+// exchangeV3 用 refreshToken + 设备签名刷新。
+func (c *Client) exchangeV3(a *auth.Auth, clientID string) (*TokenResult, error) {
+	sig, ts, nonce, err := signDeviceProof(a.DevicePrivateKey, http.MethodPost, EpExchangeV3, clientID, a.RefreshToken)
+	if err != nil {
+		return nil, err
+	}
+	body := map[string]any{
+		"ClientID":     clientID,
+		"ClientSecret": "",
+		"RefreshToken": a.RefreshToken,
+		"DeviceInfo":   deviceInfo(a, clientID),
+		"DeviceProof": map[string]any{
+			"Signature": sig,
+			"Timestamp": ts,
+			"Nonce":     nonce,
+		},
+		"IDEVersion": IdeVersion,
+	}
+	return c.postExchange(AuthHost, body, "")
+}
+
+// exchangeLegacy 旧版 ExchangeToken（无设备签名），用于兼容融合前的老凭证。
+func (c *Client) exchangeLegacy(host, clientID, refreshToken string) (*TokenResult, error) {
+	body := map[string]any{
+		"ClientID":     clientID,
+		"RefreshToken": refreshToken,
+		"ClientSecret": "-",
+		"UserID":       "",
+	}
+	raw, _ := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost, host+EpExchangeLegacy, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", clientUA)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Result *tokenPayload `json:"Result"`
+		Data   *tokenPayload `json:"Data"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("legacy exchange parse: %w", err)
+	}
+	p := resp.Result
+	if p == nil {
+		p = resp.Data
+	}
+	if p == nil || p.Token == "" {
+		return nil, fmt.Errorf("refresh_failed: %s — re-login required", truncate(string(data), 200))
+	}
+	return parseTokenPayload(*p), nil
+}
+
+// RefreshToken 刷新 access token。
+// 新凭证（带设备私钥）走 v3；老凭证走 legacy，并在两个宿主间兜底。
 func (c *Client) RefreshToken(a *auth.Auth) error {
 	a.Lock()
 	defer a.Unlock()
 
 	if strings.TrimSpace(a.RefreshToken) == "" {
-		return fmt.Errorf("no refreshToken")
+		return fmt.Errorf("no refreshToken — re-login required")
 	}
-	host := a.ApiHost
-	if host == "" {
-		host = OAuthHost
+	clientID := clientIDFor(a)
+
+	var res *TokenResult
+	var v3Err, legacyErr error
+	if strings.TrimSpace(a.DevicePrivateKey) != "" {
+		res, v3Err = c.exchangeV3(a, clientID)
 	}
+	if res == nil {
+		// 老凭证可能属于旧 SOLO client，两个 client_id / 两个宿主都试一遍。
+		ids := []string{clientID}
+		if clientID != ClientIDSolo {
+			ids = append(ids, ClientIDSolo)
+		}
+		for _, host := range []string{AuthHost, LegacyAuthHost} {
+			for _, id := range ids {
+				res, legacyErr = c.exchangeLegacy(host, id, a.RefreshToken)
+				if res != nil {
+					break
+				}
+			}
+			if res != nil {
+				break
+			}
+		}
+	}
+	if res == nil {
+		switch {
+		case v3Err != nil && legacyErr != nil:
+			return fmt.Errorf("refresh failed: v3=%v; legacy=%v", v3Err, legacyErr)
+		case legacyErr != nil:
+			return legacyErr
+		default:
+			return v3Err
+		}
+	}
+
+	a.AccessToken = res.Token
+	if res.RefreshToken != "" {
+		a.RefreshToken = res.RefreshToken
+	}
+	if res.ExpiresAt > 0 {
+		a.ExpiresAt = res.ExpiresAt
+	}
+	return nil
+}
+
+// GetUserInfo 查询账号信息（融合后需要 GetUIDFusionInfo）。
+func (c *Client) GetUserInfo(a *auth.Auth) (uid, nickname string, err error) {
 	body := map[string]any{
-		"ClientID":     ClientID,
-		"RefreshToken": a.RefreshToken,
-		"ClientSecret": "-",
-		"UserID":       "",
+		"ReqSource":        "IDE",
+		"IDEVersion":       IdeVersion,
+		"GetUIDFusionInfo": true,
 	}
 	raw, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, host+EpExchange, bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, AuthHost+EpGetUserInfo, bytes.NewReader(raw))
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", clientUA)
-
+	req.Header.Set("x-cloudide-token", a.JWT())
 	data, err := c.doJSON(req)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	var resp struct {
 		Result struct {
-			Token               string `json:"Token"`
-			TokenExpireAt       int64  `json:"TokenExpireAt"`
-			TokenExpireDuration int64  `json:"TokenExpireDuration"`
-			RefreshToken        string `json:"RefreshToken"`
+			UserID     string `json:"UserID"`
+			ScreenName string `json:"ScreenName"`
+			NickName   string `json:"NickName"`
 		} `json:"Result"`
+		Data struct {
+			UserInfo struct {
+				UserID string `json:"UserID"`
+				Name   string `json:"Name"`
+			} `json:"UserInfo"`
+		} `json:"Data"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return fmt.Errorf("exchange parse: %w", err)
+		return "", "", fmt.Errorf("userinfo parse: %w", err)
 	}
-	if resp.Result.Token == "" {
-		return fmt.Errorf("refresh_failed: no token — re-login required")
+	uid = resp.Result.UserID
+	nickname = resp.Result.ScreenName
+	if nickname == "" {
+		nickname = resp.Result.NickName
 	}
-	a.AccessToken = resp.Result.Token
-	if resp.Result.RefreshToken != "" {
-		a.RefreshToken = resp.Result.RefreshToken
+	if uid == "" {
+		uid = resp.Data.UserInfo.UserID
 	}
-	if resp.Result.TokenExpireAt > 0 {
-		exp := resp.Result.TokenExpireAt
-		if exp > 1e12 {
-			exp /= 1000
-		}
-		a.ExpiresAt = exp
-	} else if resp.Result.TokenExpireDuration > 0 {
-		a.ExpiresAt = time.Now().Add(time.Duration(resp.Result.TokenExpireDuration) * time.Second).Unix()
+	if nickname == "" {
+		nickname = resp.Data.UserInfo.Name
 	}
-	return nil
+	if uid == "" {
+		return "", "", fmt.Errorf("userinfo: no uid: %s", truncate(string(data), 200))
+	}
+	return uid, nickname, nil
 }
 
 // CheckinStatus 查询签到状态。
@@ -283,7 +604,7 @@ func ugHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+a.JWT())
 	req.Header.Set("X-User-Region", "CN")
 	if a.DeviceID != "" {
-		// 关键：必须是「客户端真实注册的设备号」（12~20 位十进制数字）。
+		// 关键：必须是「客户端真实注册的设备号」。
 		// 随机 UUID / 32 位 hex 会被服务端判为无效设备，claim 返回 code=9074
 		// （文案「当前参与用户太多」是误导，真实原因是设备校验不通过）。
 		// 同时用小写头名，与官方客户端一致。

@@ -1,16 +1,31 @@
-# trae-signin — TRAE SOLO 纯签到工具
+# trae-signin — TRAE 纯签到工具（豆包账号版）
 
-TRAE Work (SOLO CN) 的轻量签到工具。只做三件事：**登录 → 签到 → 查积分**，没有任何 OpenAI API 反代或对话功能。
+TRAE（CN）的轻量签到工具。只做三件事：**登录 → 签到 → 查积分**，没有任何 OpenAI API 反代或对话功能。
 
 基于 [traework2api](https://github.com/Sliverkiss/traework2api) 精简而来。
 
+已适配 **2026-11-18 起 TRAE 账号并入豆包飞书账号**的新登录/刷新体系（豆包 SSO + PKCE + v3 ExchangeToken 设备签名）。
+
 纯 Go 标准库，零第三方依赖。
+
+## 账号体系融合升级（2026-11-18）
+
+TRAE 账号已经升级为豆包飞书账号，旧的登录/刷新方式失效：
+
+| 项目 | 旧 | 新 |
+|---|---|---|
+| 登录 | 回调里直接带 `refreshToken` | 豆包 SSO 回调 `authCodeInfo` + PKCE 换 token |
+| 刷新 token | `api.trae.com.cn/cloudide/.../ExchangeToken` | `api.trae.cn/trae/api/v3/oauth/ExchangeToken`，需设备密钥签名 |
+| 账号信息 | `GetUserInfo` | `GetUserInfo` + `GetUIDFusionInfo: true` |
+| 签到/积分 | `api.trae.cn/trae/api/v2/ug/...` | **未变** |
+
+因此升级后需要重新登录一次，生成带设备密钥对的新凭证；旧凭证仍会尝试走 legacy 接口兜底，但随时可能彻底失效。
 
 ## 功能
 
 | 功能 | 说明 |
 |------|------|
-| **登录** | `login.sh` 生成登录链接 → 浏览器登录 → 粘贴回调 → 自动换 token 落盘 |
+| **登录** | `login.sh` 走豆包 SSO：生成登录链接 → 浏览器登录 → 粘贴回调 → 自动换 token 落盘（含设备密钥对） |
 | **签到** | 批量遍历 `auths/` 下所有账号，自动刷新过期 token，逐个签到 |
 | **到账校验** | 签到后回查确认，接口返回成功但积分未到账会标记为 `UNCONFIRMED`（不谎报成功） |
 | **积分拆分** | 分别显示「月赠额度」与「签到奖励额度」，一眼看出签到有没有加分 |
@@ -20,7 +35,7 @@ TRAE Work (SOLO CN) 的轻量签到工具。只做三件事：**登录 → 签�
 ## 快速开始
 
 ```bash
-# 1. 安装依赖（需要 Go 1.21+ 和 Python 3）
+# 1. 安装依赖（需要 Go 1.21+；Bark 通知的标题编码需要 Python 3）
 # macOS: brew install go python3
 # Ubuntu: apt install golang python3
 
@@ -29,13 +44,47 @@ git clone https://github.com/<your-username>/trae-signin.git
 cd trae-signin
 chmod +x login.sh signin.sh
 
-# 3. 登录账号
+# 3. 登录账号（设备号默认自动从 TRAE 客户端读取）
 ./login.sh
 # → 浏览器打开链接 → 手机号/验证码登录 → 粘贴回调链接
 
 # 4. 签到
 ./signin.sh
 # → 自动刷新 token → 签到 → 显示积分 → Bark 通知
+```
+
+### Windows 用户
+
+登录必须在**装了 TRAE 客户端的那台机器**上做（要读 `storage.json` 里的真实设备号），但签到可以放到 Linux / NAS / CI 上跑。
+
+```powershell
+# 在 Windows 上登录（PowerShell，不需要 Git Bash / WSL）
+cd D:\path\to\trae-signin
+.\login.ps1
+
+# 也可以直接跑 Go 命令
+go run ./cmd/login
+```
+
+`login.sh` 是 bash 脚本，Windows 上可用 Git Bash 运行；PowerShell 用 `login.ps1`。
+
+登录完成后，把生成的 `auths/trae-*.json` 复制到 Linux 服务器即可——**不需要复制 storage.json**，设备号和设备私钥都已经在凭证 JSON 里。
+
+### 在 Linux 上签到
+
+两种方式都可以：
+
+```bash
+# 方式 A：复制源码到 Linux，直接编译运行（零第三方依赖）
+git clone <repo> && cd trae-signin
+go build -o signin_bin ./cmd/signin
+./signin_bin auths
+
+# 方式 B：Windows 交叉编译后只传二进制
+# PowerShell:
+#   $env:GOOS="linux"; $env:GOARCH="amd64"
+#   go build -o signin_bin ./cmd/signin
+# 然后 scp signin_bin 和 auths/ 到 Linux 执行
 ```
 
 ## Bark 通知配置
@@ -72,18 +121,26 @@ export BARK_URL="https://api.day.app/你的Key"
 ### 为什么随机设备号不行
 
 - 自己生成的 32 位 hex / UUID → 服务端直接忽略 → `9074`
-- **走一遍 OAuth 登录也不会把设备号注册成可信设备** → 照样 `9074`
 - 真号只能从**装过 TRAE 客户端并登录过的机器**上取
 
 ### 怎么取真实设备号
 
-在装了 TRAE 客户端的机器上，打开客户端的 `storage.json`（Windows 通常在
-`%APPDATA%\TRAE SOLO CN\` 或 `%APPDATA%\Trae\`），搜索 `iCubeAuthInfo://icube-dc`：
+`login.sh` 会自动在下列位置查找，无需手动输入：
+
+```text
+Windows: %APPDATA%\Trae CN\User\globalStorage\storage.json
+         %APPDATA%\TRAE SOLO CN\User\globalStorage\storage.json
+         %APPDATA%\Trae\User\globalStorage\storage.json
+macOS:   ~/Library/Application Support/Trae CN/User/globalStorage/storage.json
+Linux:   ~/.config/Trae CN/User/globalStorage/storage.json
+```
+
+文件里搜索 `iCubeAuthInfo://icube-dc`：
 
 ```json
 "iCubeAuthInfo://icube-dc:1234567890123": "dGMFEAAA..."
                         ^^^^^^^^^^^^^^^
-                        这串数字就是设备号（12~20 位十进制，示例中为占位值）
+                        这串数字就是设备号（8~24 位十进制，示例中为占位值）
 ```
 
 **注意**：不要用 `telemetry.devDeviceId`（UUID 格式，会被拒绝）。
@@ -107,11 +164,23 @@ export BARK_URL="https://api.day.app/你的Key"
 ### 用法
 
 ```bash
-# 登录时指定设备号（不再随机生成）
+# 默认自动检测设备号
+./login.sh
+
+# 手动指定设备号
 DEVICE_ID=1234567890123 ./login.sh
 
-# 已有凭证文件的话，直接改 deviceId 字段即可
+# 旧 SOLO 账号如果换 token 失败，可指定旧 client_id
+./login.sh -client-id en1oxy7wnw8j9n
+
+# 只打印登录链接，不等待回调（调试用）
+./login.sh -print-url
 ```
+
+登录成功后凭证里会多出 `clientId` / `devicePrivateKey` / `devicePublicKey` 三个字段，
+**不要手动删除**——刷新 token 时要用私钥做设备签名。
+
+已有旧凭证也可以直接补 `deviceId` 字段，但仍然建议重新登录一次。
 
 ## 签到状态说明
 
@@ -139,9 +208,9 @@ TRAE 的积分由**多个独立到期的包**组成，`总计` 是它们的合�
 
 ## 定时签到
 
-### 方式一：GitHub Actions（推荐）
+### 方式一：GitHub Actions（推荐，仍然支持）
 
-最稳定的方案，不依赖本地环境，GitHub 服务器每天自动触发。
+最稳定的方案，不依赖本地环境，GitHub 服务器每天自动触发。**Actions 只负责签到，登录仍需在本地做一次。**
 
 **配置步骤：**
 
@@ -151,16 +220,23 @@ TRAE 的积分由**多个独立到期的包**组成，`总计` 是它们的合�
 
    | Secret 名称 | 值 | 说明 |
    |---|---|---|
-   | `TRAE_AUTH_1` | 账号1 的完整凭证 JSON | `auths/trae-*.json` 的文件内容 |
+   | `TRAE_AUTH_1` | 账号1 的完整凭证 JSON | **新版** `auths/trae-*.json` 的文件内容 |
    | `TRAE_AUTH_2` | 账号2 的完整凭证 JSON | 同上，多个账号依次添加 |
    | `BARK_URL` | `https://api.day.app/你的Key` | Bark 推送地址 |
 
+   > 账号融合后请用新版 `login.ps1` / `login.sh` 重新登录，把**新的**凭证 JSON 覆盖到 Secrets。
+   > 旧凭证缺少设备私钥，只能走 legacy 兜底，大概率已经失效。
+
 3. 每天北京时间 08:00 自动执行，也可在 Actions 页面手动触发
 
-> 凭证 JSON 格式（登录后从 `auths/trae-*.json` 复制）：
+> 凭证 JSON 格式（**用新版 `./login.sh` 重新登录后**从 `auths/trae-*.json` 复制）：
 > ```json
-> {"account":{"uid":"...","nickname":"..."},"auth":{"accessToken":"...","refreshToken":"...","expiresAt":1786858238,...}}
+> {"account":{"uid":"...","nickname":"..."},"auth":{"accessToken":"...","refreshToken":"...","expiresAt":1786858238,
+>  "clientId":"ono9krqynydwx5","deviceId":"...","machineId":"...","devicePrivateKey":"-----BEGIN PRIVATE KEY-----...",
+>  "devicePublicKey":"-----BEGIN PUBLIC KEY-----..."}}
 > ```
+>
+> 账号融合后，`devicePrivateKey` 是刷新 token 的必需品；缺失时只能走旧接口兜底。
 
 ### 方式二：Crontab
 
@@ -175,13 +251,15 @@ crontab -e
 
 ```
 cmd/
+├── login/main.go       登录入口（豆包 SSO + PKCE + v3 换 token）
 └── signin/main.go      签到入口
 
 internal/
-├── auth/auth.go        凭证文件解析与原子写回
+├── auth/auth.go        凭证文件解析与原子写回（含设备密钥对）
 └── upstream/upstream.go 上游 API 客户端（签到/积分/刷新 token）
 
-login.sh                登录脚本
+login.sh                登录脚本（macOS/Linux/Git Bash，包装 cmd/login）
+login.ps1               登录脚本（Windows PowerShell，包装 cmd/login）
 signin.sh               签到脚本（含 Bark 通知）
 crontab.txt             Crontab 配置参考
 auths/                  （gitignored）凭证文件
@@ -193,16 +271,18 @@ auths/                  （gitignored）凭证文件
 
 | 端点 | 用途 |
 |------|------|
-| `api.trae.com.cn/.../ExchangeToken` | 用 refreshToken 换 accessToken |
-| `api.trae.cn/.../checkin_credits/status` | 查询签到状态 |
-| `api.trae.cn/.../checkin_credits/claim` | 执行签到 |
-| `api.trae.cn/.../ide_user_ent_usage` | 查询积分余额 |
+| `api.trae.cn/trae/api/v3/oauth/ExchangeToken` | AuthCode / refreshToken 换 accessToken（v3，需设备签名） |
+| `api.trae.cn/cloudide/api/v3/trae/ExchangeToken` | 旧版换 token（仅兜底） |
+| `api.trae.cn/cloudide/api/v3/trae/GetUserInfo` | 查询账号信息（`GetUIDFusionInfo`） |
+| `api.trae.cn/trae/api/v2/ug/checkin_credits/status` | 查询签到状态 |
+| `api.trae.cn/trae/api/v2/ug/checkin_credits/claim` | 执行签到 |
+| `api.trae.cn/trae/api/v2/pay/ide_user_ent_usage` | 查询积分余额 |
 
 ## 安全说明
 
-- 所有 token 仅保存在 `auths/` 目录（已 gitignored），不会上传到 Git
+- 所有 token 和**设备私钥**仅保存在 `auths/` 目录（已 gitignored），不会上传到 Git
 - 终端输出只显示 UID/昵称/积分，不打印 token
-- `login.sh` 回调链接使用 `read -s` 不回显，避免终端留痕
+- 回调链接里只有一次性 AuthCode，不包含长期凭证
 
 ## 致谢
 

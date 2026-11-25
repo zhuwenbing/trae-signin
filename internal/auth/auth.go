@@ -17,7 +17,7 @@ type Auth struct {
 
 	AccessToken  string
 	RefreshToken string
-	ExpiresAt    int64  // Unix 秒
+	ExpiresAt    int64 // Unix 秒
 	Domain       string
 	ApiHost      string
 	MachineID    string
@@ -25,12 +25,17 @@ type Auth struct {
 	UID          string
 	EnterpriseID string
 	Nickname     string
-	FilePath     string
+	ClientID     string
+	// 豆包账号融合后，refresh token 与设备密钥绑定：
+	// 刷新时需要用同一把私钥对请求签名（DeviceProof）。
+	DevicePrivateKey string
+	DevicePublicKey  string
+	FilePath         string
 }
 
-func (a *Auth) Lock()   { a.mu.Lock() }
-func (a *Auth) Unlock() { a.mu.Unlock() }
-func (a *Auth) RLock()  { a.mu.RLock() }
+func (a *Auth) Lock()    { a.mu.Lock() }
+func (a *Auth) Unlock()  { a.mu.Unlock() }
+func (a *Auth) RLock()   { a.mu.RLock() }
 func (a *Auth) RUnlock() { a.mu.RUnlock() }
 
 func (a *Auth) JWT() string {
@@ -68,6 +73,9 @@ func parseNested(raw []byte) (*Auth, error) {
 			ApiHost      string `json:"apiHost"`
 			MachineID    string `json:"machineId"`
 			DeviceID     string `json:"deviceId"`
+			ClientID     string `json:"clientId"`
+			DevicePriv   string `json:"devicePrivateKey"`
+			DevicePub    string `json:"devicePublicKey"`
 		} `json:"auth"`
 		Account struct {
 			UID          string `json:"uid"`
@@ -79,16 +87,19 @@ func parseNested(raw []byte) (*Auth, error) {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
 	}
 	return &Auth{
-		AccessToken:  n.Auth.AccessToken,
-		RefreshToken: n.Auth.RefreshToken,
-		ExpiresAt:    n.Auth.ExpiresAt,
-		Domain:       n.Auth.Domain,
-		ApiHost:      n.Auth.ApiHost,
-		MachineID:    n.Auth.MachineID,
-		DeviceID:     n.Auth.DeviceID,
-		UID:          n.Account.UID,
-		EnterpriseID: n.Account.EnterpriseID,
-		Nickname:     n.Account.Nickname,
+		AccessToken:      n.Auth.AccessToken,
+		RefreshToken:     n.Auth.RefreshToken,
+		ExpiresAt:        n.Auth.ExpiresAt,
+		Domain:           n.Auth.Domain,
+		ApiHost:          n.Auth.ApiHost,
+		MachineID:        n.Auth.MachineID,
+		DeviceID:         n.Auth.DeviceID,
+		UID:              n.Account.UID,
+		EnterpriseID:     n.Account.EnterpriseID,
+		Nickname:         n.Account.Nickname,
+		ClientID:         n.Auth.ClientID,
+		DevicePrivateKey: n.Auth.DevicePriv,
+		DevicePublicKey:  n.Auth.DevicePub,
 	}, nil
 }
 
@@ -101,6 +112,9 @@ func parseFlat(raw []byte) (*Auth, error) {
 		ApiHost      string `json:"apiHost"`
 		MachineID    string `json:"machineId"`
 		DeviceID     string `json:"deviceId"`
+		ClientID     string `json:"clientId"`
+		DevicePriv   string `json:"devicePrivateKey"`
+		DevicePub    string `json:"devicePublicKey"`
 		UID          string `json:"uid"`
 		EnterpriseID string `json:"enterpriseId"`
 		Nickname     string `json:"nickname"`
@@ -109,16 +123,19 @@ func parseFlat(raw []byte) (*Auth, error) {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
 	}
 	return &Auth{
-		AccessToken:  f.AccessToken,
-		RefreshToken: f.RefreshToken,
-		ExpiresAt:    f.ExpiresAt,
-		Domain:       f.Domain,
-		ApiHost:      f.ApiHost,
-		MachineID:    f.MachineID,
-		DeviceID:     f.DeviceID,
-		UID:          f.UID,
-		EnterpriseID: f.EnterpriseID,
-		Nickname:     f.Nickname,
+		AccessToken:      f.AccessToken,
+		RefreshToken:     f.RefreshToken,
+		ExpiresAt:        f.ExpiresAt,
+		Domain:           f.Domain,
+		ApiHost:          f.ApiHost,
+		MachineID:        f.MachineID,
+		DeviceID:         f.DeviceID,
+		UID:              f.UID,
+		EnterpriseID:     f.EnterpriseID,
+		Nickname:         f.Nickname,
+		ClientID:         f.ClientID,
+		DevicePrivateKey: f.DevicePriv,
+		DevicePublicKey:  f.DevicePub,
 	}, nil
 }
 
@@ -160,13 +177,16 @@ func (a *Auth) saveAtomicLocked() error {
 	}
 	doc := map[string]any{
 		"auth": map[string]any{
-			"accessToken":  a.AccessToken,
-			"refreshToken": a.RefreshToken,
-			"expiresAt":    a.ExpiresAt,
-			"domain":       a.Domain,
-			"apiHost":      a.ApiHost,
-			"machineId":    a.MachineID,
-			"deviceId":     a.DeviceID,
+			"accessToken":      a.AccessToken,
+			"refreshToken":     a.RefreshToken,
+			"expiresAt":        a.ExpiresAt,
+			"domain":           a.Domain,
+			"apiHost":          a.ApiHost,
+			"machineId":        a.MachineID,
+			"deviceId":         a.DeviceID,
+			"clientId":         a.ClientID,
+			"devicePrivateKey": a.DevicePrivateKey,
+			"devicePublicKey":  a.DevicePublicKey,
 		},
 		"account": map[string]any{
 			"uid":          a.UID,
