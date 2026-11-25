@@ -499,7 +499,7 @@ func (c *Client) CheckinClaim(a *auth.Auth) error {
 
 // CreditPack 单个积分包的摘要。
 type CreditPack struct {
-	Credits   int64  // 该包额度
+	Credits   int64  // 该包剩余额度（credits_limit - usage.credits_amount）
 	Desc      string // 展示名（display_desc / group_name 兜底）
 	Expire    int64  // 过期 Unix 秒，0 表示无
 	IsCheckin bool   // 是否签到奖励包
@@ -524,9 +524,23 @@ func (c *Client) UserEntUsage(a *auth.Auth) (remain int64, err error) {
 	return s.Total, nil
 }
 
+// 积分来源：账号体系与豆包合并后，余额按来源拆分。
+const (
+	creditSourceTrae   = 1
+	creditSourceDoubao = 2
+)
+
 // UserCreditSummary 查询积分余额并拆分签到包 / 月赠包。
+//
+// 账号融合后 ide_user_ent_usage 返回的是 Trae + 豆包的合并余额：
+//   - balance_summary[].source: 1=Trae, 2=豆包
+//   - total_balance: 两个来源的合计
+//
+// 本工具只签到 Trae，因此展示 Trae 的余额（source=1），
+// 不能直接用 total_balance，否则会把豆包积分也算进来。
 func (c *Client) UserCreditSummary(a *auth.Auth) (*CreditSummary, error) {
-	req, err := http.NewRequest(http.MethodPost, UgHost+EpEntUsage, bytes.NewReader([]byte("{}")))
+	body := []byte(`{"require_usage":true,"req_source":1}`)
+	req, err := http.NewRequest(http.MethodPost, UgHost+EpEntUsage, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -536,10 +550,16 @@ func (c *Client) UserCreditSummary(a *auth.Auth) (*CreditSummary, error) {
 		return nil, err
 	}
 	var resp struct {
+		TotalBalance   *float64 `json:"total_balance"`
+		BalanceSummary []struct {
+			Source       int64   `json:"source"`
+			TotalBalance float64 `json:"total_balance"`
+		} `json:"balance_summary"`
 		UsageSummary struct {
 			TotalAmount float64 `json:"total_amount"`
 		} `json:"usage_summary"`
 		UserEntitlementPackList []struct {
+			Source              int64  `json:"source"`
 			DisplayDesc         string `json:"display_desc"`
 			GroupName           string `json:"group_name"`
 			GroupType           int64  `json:"group_type"`
@@ -550,6 +570,9 @@ func (c *Client) UserCreditSummary(a *auth.Auth) (*CreditSummary, error) {
 					CreditsLimit float64 `json:"credits_limit"`
 				} `json:"quota"`
 			} `json:"entitlement_base_info"`
+			Usage struct {
+				CreditsAmount float64 `json:"credits_amount"`
+			} `json:"usage"`
 		} `json:"user_entitlement_pack_list"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
@@ -558,7 +581,14 @@ func (c *Client) UserCreditSummary(a *auth.Auth) (*CreditSummary, error) {
 
 	s := &CreditSummary{}
 	for _, p := range resp.UserEntitlementPackList {
-		credits := int64(p.EntitlementBaseInfo.Quota.CreditsLimit)
+		// 融合账号下可能混入豆包权益包，直接跳过。
+		if p.Source == creditSourceDoubao {
+			continue
+		}
+		limit := int64(p.EntitlementBaseInfo.Quota.CreditsLimit)
+		// credits_limit 是发放总额，usage.credits_amount 是已用量，
+		// 两者相减才是该包剩余额度（与官方客户端一致）。
+		credits := limit - int64(p.Usage.CreditsAmount)
 		desc := p.DisplayDesc
 		if desc == "" {
 			desc = p.GroupName
@@ -568,7 +598,7 @@ func (c *Client) UserCreditSummary(a *auth.Auth) (*CreditSummary, error) {
 			strings.Contains(desc, "签到") ||
 			strings.Contains(p.EntitlementBaseInfo.EntitlementID, "checkin")
 
-		if credits <= 0 { // 免费权益壳，无额度，不计入
+		if credits <= 0 { // 免费权益壳或已用完，不计入
 			continue
 		}
 		s.Packs = append(s.Packs, CreditPack{
@@ -587,12 +617,41 @@ func (c *Client) UserCreditSummary(a *auth.Auth) (*CreditSummary, error) {
 		}
 	}
 
-	// 以服务端 usage_summary.total_amount 为准：它是真实可用总额，
-	// 而各包 credits_limit 只是名义额度（消耗后 total 会下降、limit 不变）。
-	if resp.UsageSummary.TotalAmount > 0 {
+	// 优先取 balance_summary 中 source=1（Trae）的余额；
+	// 缺失时用 total_balance 减去豆包余额兜底。
+	var traeBal, doubaoBal *float64
+	for i := range resp.BalanceSummary {
+		b := &resp.BalanceSummary[i]
+		switch b.Source {
+		case creditSourceTrae:
+			traeBal = &b.TotalBalance
+		case creditSourceDoubao:
+			doubaoBal = &b.TotalBalance
+		}
+	}
+	switch {
+	case traeBal != nil:
+		s.Total = int64(*traeBal)
+	case resp.TotalBalance != nil && doubaoBal != nil:
+		s.Total = int64(*resp.TotalBalance - *doubaoBal)
+	case resp.TotalBalance != nil:
+		s.Total = int64(*resp.TotalBalance)
+	case resp.UsageSummary.TotalAmount > 0:
+		// 旧版响应（未融合账号）
 		s.Total = int64(resp.UsageSummary.TotalAmount)
-	} else {
+	default:
 		s.Total = s.Month + s.Checkin
+	}
+	if s.Total < 0 {
+		s.Total = 0
+	}
+	// balance_summary 是 Trae 的真实剩余余额，由它反推月赠额度，
+	// 避免把豆包的权益包混进「月赠」列。
+	if traeBal != nil || doubaoBal != nil || resp.TotalBalance != nil {
+		if s.Checkin > s.Total {
+			s.Checkin = s.Total
+		}
+		s.Month = s.Total - s.Checkin
 	}
 	return s, nil
 }
