@@ -25,13 +25,15 @@ jobs:
         run: go build -o signin_bin ./cmd/signin
 
       - name: 生成凭证文件
+        env:
+          AUTH_1: ${{ secrets.TRAE_AUTH_1 }}
+          AUTH_2: ${{ secrets.TRAE_AUTH_2 }}
         run: |
           mkdir -p auths
-          # 账号1
-          echo '${{ secrets.TRAE_AUTH_1 }}' > auths/trae-1.json
-          # 账号2
-          echo '${{ secrets.TRAE_AUTH_2 }}' > auths/trae-2.json
-          # 如需更多账号，添加更多 TRAE_AUTH_N
+          # 仅在对应 Secret 已配置时生成，避免空文件被当成失败账号
+          if [ -n "$AUTH_1" ]; then printf '%s\n' "$AUTH_1" > auths/trae-1.json; fi
+          if [ -n "$AUTH_2" ]; then printf '%s\n' "$AUTH_2" > auths/trae-2.json; fi
+          # 如需更多账号，按同样方式添加 TRAE_AUTH_N
 
       - name: 执行签到
         run: |
@@ -85,6 +87,7 @@ jobs:
           fi
           shopt -s nullglob
           for f in auths/trae-*.json; do
+            [ -s "$f" ] || continue
             name="TRAE_AUTH_$(basename "$f" .json | sed 's/^trae-//')"
             gh secret set "$name" --body "$(cat "$f")"
             echo "已更新 Secret: $name"
