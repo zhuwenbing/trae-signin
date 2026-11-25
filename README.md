@@ -227,11 +227,33 @@ TRAE 的积分由**多个独立到期的包**组成，`总计` 是它们的合�
    | `TRAE_AUTH_1` | 账号1 的完整凭证 JSON | **新版** `auths/trae-*.json` 的文件内容 |
    | `TRAE_AUTH_2` | 账号2 的完整凭证 JSON | 同上，多个账号依次添加 |
    | `BARK_URL` | `https://api.day.app/你的Key` | Bark 推送地址 |
+   | `GH_PAT` | 可选，Personal Access Token | 用于把刷新后的凭证自动写回 Secrets |
 
    > 账号融合后请用新版 `login.ps1` / `login.sh` 重新登录，把**新的**凭证 JSON 覆盖到 Secrets。
    > 旧凭证缺少设备私钥，只能走 legacy 兜底，大概率已经失效。
 
 3. 每天北京时间 08:00 自动执行，也可在 Actions 页面手动触发
+
+4. 可选：配置 `GH_PAT` 自动回写凭证
+
+   Actions 的 `GITHUB_TOKEN` **不能**修改 Secrets，且运行器里的 `auths/` 会在结束时删除。
+   由于 refreshToken 会随刷新轮换，建议创建一个 PAT 并保存为 `GH_PAT`：
+
+   - fine-grained PAT：仓库权限勾选 **Secrets: Read and write**
+   - 或 classic PAT：勾选 `repo`
+
+   配置后，每次签到结束会把刷新后的凭证写回 `TRAE_AUTH_1/2`，无需再手动更新。
+   不配置也能跑，但 refreshToken 轮换后 Secret 会失效，需要重新登录并手动覆盖。
+
+5. 仓库保活（已内置）
+
+   GitHub 会在仓库连续 60 天无提交时停用定时任务，因此仓库自带
+   [keepalive.yml](.github/workflows/keepalive.yml)，每月 1 日、15 日自动提交一次时间戳。
+   它需要 `contents: write` 权限，请确认：
+
+   **Settings → Actions → General → Workflow permissions → Read and write permissions**
+
+   `signin.yml` 本身只需要读取权限，不受此项影响。
 
 > 凭证 JSON 格式（**用新版 `./login.sh` 重新登录后**从 `auths/trae-*.json` 复制）：
 > ```json

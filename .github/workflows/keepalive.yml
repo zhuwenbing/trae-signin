@@ -1,0 +1,32 @@
+name: 仓库保活
+
+on:
+  schedule:
+    # 每月 1 日、15 日 00:20 UTC（北京时间 08:20）
+    # GitHub 在仓库连续 60 天无提交活动时会自动停用定时任务，
+    # 这里定期写入时间戳，保证签到 workflow 不会被停用。
+    - cron: '20 0 1,15 * *'
+  workflow_dispatch: # 支持手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 更新时间戳
+        run: |
+          mkdir -p .github
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/keepalive
+
+      - name: 提交并推送
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/keepalive
+          git commit -m "chore: keepalive $(date -u +%Y-%m-%d)"
+          git push

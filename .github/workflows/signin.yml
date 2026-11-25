@@ -6,6 +6,9 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch: # 支持手动触发
 
+permissions:
+  contents: read
+
 jobs:
   signin:
     runs-on: ubuntu-latest
@@ -67,6 +70,25 @@ jobs:
           TITLE_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$TITLE'))")
           BODY_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$BODY'))")
           curl -s -X POST "${{ secrets.BARK_URL }}/${TITLE_ENC}/${BODY_ENC}" || true
+
+      # 可选：refreshToken 会随刷新轮换，用 GH_PAT 把新凭证写回 Secrets。
+      # GH_PAT 需具备 secrets: write 权限（fine-grained）或 repo 权限（classic）。
+      # 不配置则跳过；refreshToken 轮换后旧 Secret 会失效，需要重新登录。
+      - name: 回写刷新后的凭证
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "未配置 GH_PAT，跳过凭证回写"
+            exit 0
+          fi
+          shopt -s nullglob
+          for f in auths/trae-*.json; do
+            name="TRAE_AUTH_$(basename "$f" .json | sed 's/^trae-//')"
+            gh secret set "$name" --body "$(cat "$f")"
+            echo "已更新 Secret: $name"
+          done
 
       - name: 清理凭证
         if: always()
