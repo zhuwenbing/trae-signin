@@ -2,8 +2,11 @@ name: TRAE 每日签到
 
 on:
   schedule:
-    # 每天 00:00 UTC = 08:00 北京时间
-    - cron: '0 0 * * *'
+    # GitHub cron 使用 UTC，且整点附近容易排队/延迟，这里错开 10 分钟。
+    # 主签到：北京时间 08:10（UTC 00:10）
+    # 兜底签到：北京时间 16:10（UTC 08:10）
+    - cron: '10 0 * * *'
+    - cron: '10 8 * * *'
   workflow_dispatch: # 支持手动触发
 
 permissions:
@@ -34,6 +37,15 @@ jobs:
           if [ -n "$AUTH_1" ]; then printf '%s\n' "$AUTH_1" > auths/trae-1.json; fi
           if [ -n "$AUTH_2" ]; then printf '%s\n' "$AUTH_2" > auths/trae-2.json; fi
           # 如需更多账号，按同样方式添加 TRAE_AUTH_N
+
+      - name: 随机延迟
+        if: github.event_name == 'schedule'
+        run: |
+          # 定时触发时随机等待 1~15 分钟，避免每天签到时间完全一致。
+          # 手动触发不等待，方便调试。
+          DELAY=$((RANDOM % 840 + 60))
+          echo "定时触发，随机等待 ${DELAY}s 后开始签到"
+          sleep "$DELAY"
 
       - name: 执行签到
         run: |
