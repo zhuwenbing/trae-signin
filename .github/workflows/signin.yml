@@ -65,10 +65,24 @@ jobs:
           echo "$SIGNIN_OUTPUT" | grep -oP '未确认=\K\d+' | head -1 | xargs -I{} echo "unconf={}" >> $GITHUB_OUTPUT || echo "unconf=0" >> $GITHUB_OUTPUT
           echo "$SIGNIN_OUTPUT" | grep -oP '设备异常=\K\d+' | head -1 | xargs -I{} echo "busy={}" >> $GITHUB_OUTPUT || echo "busy=0" >> $GITHUB_OUTPUT
           echo "$SIGNIN_OUTPUT" | grep -oP '失败=\K\d+' | head -1 | xargs -I{} echo "fail={}" >> $GITHUB_OUTPUT || echo "fail=?" >> $GITHUB_OUTPUT
+          # 只有 token 真正刷新过才需要回写 Secret
+          if echo "$SIGNIN_OUTPUT" | grep -q "token 刷新成功"; then
+            echo "refreshed=1" >> $GITHUB_OUTPUT
+          else
+            echo "refreshed=0" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Bark 通知
+      - name: Server酱 / Bark 通知
         if: always()
+        env:
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          SERVERCHAN_API: ${{ secrets.SERVERCHAN_API }}
+          BARK_URL: ${{ secrets.BARK_URL }}
         run: |
+          if [ -z "$SERVERCHAN_SENDKEY" ] && [ -z "$BARK_URL" ]; then
+            echo "未配置 SERVERCHAN_SENDKEY / BARK_URL，跳过通知"
+            exit 0
+          fi
           TITLE="✅ TRAE签到"
           BODY="总计${{ steps.result.outputs.total }} 成功${{ steps.result.outputs.ok }} 已签${{ steps.result.outputs.already }} 禁用${{ steps.result.outputs.disabled }} 未确认${{ steps.result.outputs.unconf }} 设备异常${{ steps.result.outputs.busy }} 失败${{ steps.result.outputs.fail }}"
           if [ "${{ steps.result.outputs.busy }}" -gt 0 ] 2>/dev/null; then
@@ -80,16 +94,36 @@ jobs:
           if [ "${{ steps.result.outputs.fail }}" -gt 0 ] 2>/dev/null; then
             TITLE="⚠️ TRAE签到异常"
           fi
-          # URL 编码
-          TITLE_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$TITLE'))")
-          BODY_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$BODY'))")
-          curl -s -X POST "${{ secrets.BARK_URL }}/${TITLE_ENC}/${BODY_ENC}" || true
+
+          if [ -n "$SERVERCHAN_SENDKEY" ]; then
+            API="${SERVERCHAN_API:-https://sctapi.ftqq.com}"
+            API="${API%/}"
+            if curl -fsS -X POST "$API/$SERVERCHAN_SENDKEY.send" \
+                --data-urlencode "title=$TITLE" \
+                --data-urlencode "desp=$BODY" >/dev/null 2>&1; then
+              echo "Server酱通知已发送"
+            else
+              echo "Server酱通知发送失败，请检查 SERVERCHAN_SENDKEY / SERVERCHAN_API"
+            fi
+          fi
+
+          if [ -n "$BARK_URL" ]; then
+            BARK_URL="${BARK_URL%/}"
+            urlencode() {
+              printf '%s' "$1" | od -An -tx1 | tr -d ' \n' | sed 's/../%&/g'
+            }
+            if curl -fsS "$BARK_URL/$(urlencode "$TITLE")/$(urlencode "$BODY")" >/dev/null 2>&1; then
+              echo "Bark通知已发送"
+            else
+              echo "Bark通知发送失败，请检查 BARK_URL"
+            fi
+          fi
 
       # 可选：refreshToken 会随刷新轮换，用 GH_PAT 把新凭证写回 Secrets。
       # GH_PAT 需具备 secrets: write 权限（fine-grained）或 repo 权限（classic）。
-      # 不配置则跳过；refreshToken 轮换后旧 Secret 会失效，需要重新登录。
+      # 仅在本次运行真正刷新过 token 时才回写；未刷新则跳过。
       - name: 回写刷新后的凭证
-        if: always()
+        if: always() && steps.result.outputs.refreshed == '1'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |

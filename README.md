@@ -29,15 +29,15 @@ TRAE 账号已经升级为豆包飞书账号，旧的登录/刷新方式失效�
 | **签到** | 批量遍历 `auths/` 下所有账号，自动刷新过期 token，逐个签到 |
 | **到账校验** | 签到后回查确认，接口返回成功但积分未到账会标记为 `UNCONFIRMED`（不谎报成功） |
 | **积分拆分** | 分别显示「月赠额度」与「签到奖励额度」，一眼看出签到有没有加分 |
-| **Bark 通知** | 签到完成后自动推送到 Bark（iOS 通知） |
-| **定时签到** | GitHub Actions 每天定时执行 |
+| **通知** | 签到完成后按配置推送到 Server酱 / Bark，可只配一个或同时启用 |
+| **定时签到** | GitHub Actions 每天 08:10、16:10 自动执行 |
 
 ## 快速开始
 
 ```bash
-# 1. 安装依赖（需要 Go 1.21+；Bark 通知的标题编码需要 Python 3）
-# macOS: brew install go python3
-# Ubuntu: apt install golang python3
+# 1. 安装依赖（需要 Go 1.21+；通知使用 curl）
+# macOS: brew install go curl
+# Ubuntu: apt install golang curl
 
 # 2. 克隆仓库
 git clone https://github.com/<your-username>/trae-signin.git
@@ -50,7 +50,7 @@ chmod +x login.sh signin.sh
 
 # 4. 签到
 ./signin.sh
-# → 自动刷新 token → 签到 → 显示积分 → Bark 通知
+# → 自动刷新 token → 签到 → 显示积分 → Server酱 / Bark 通知
 ```
 
 ### Windows 用户
@@ -87,12 +87,20 @@ go build -o signin_bin ./cmd/signin
 # 然后 scp signin_bin 和 auths/ 到 Linux 执行
 ```
 
-## Bark 通知配置
+## Server酱 / Bark 通知配置
 
-签到完成后自动推送到 Bark。通过环境变量设置（**不要把真实 Key 写进仓库**）：
+签到完成后会按配置推送：配置 `SERVERCHAN_SENDKEY` 启用 Server酱，配置 `BARK_URL` 启用 Bark。两个都配置就两个都发，只配置一个就只发一个（**不要把真实 Key 写进仓库**）。
 
 ```bash
+# Server酱
+export SERVERCHAN_SENDKEY="SCT..."
+
+# Server酱³ 需要自定义端点
+export SERVERCHAN_API="https://<uid>.push.ft07.com/send"
+
+# Bark（可选）
 export BARK_URL="https://api.day.app/你的Key"
+
 ./signin.sh
 ```
 
@@ -226,7 +234,9 @@ TRAE 的积分由**多个独立到期的包**组成，`总计` 是它们的合�
    |---|---|---|
    | `TRAE_AUTH_1` | 账号1 的完整凭证 JSON | **新版** `auths/trae-*.json` 的文件内容 |
    | `TRAE_AUTH_2` | 账号2 的完整凭证 JSON | 同上，多个账号依次添加 |
-   | `BARK_URL` | `https://api.day.app/你的Key` | Bark 推送地址 |
+   | `SERVERCHAN_SENDKEY` | 可选，Server酱 SendKey | 配置后启用 Server酱 通知 |
+   | `SERVERCHAN_API` | 可选，自定义端点 | Server酱³ 使用，默认 `https://sctapi.ftqq.com` |
+   | `BARK_URL` | 可选，`https://api.day.app/你的Key` | 配置后启用 Bark 通知 |
    | `GH_PAT` | 可选，Personal Access Token | 用于把刷新后的凭证自动写回 Secrets |
 
    > 账号融合后请用新版 `login.ps1` / `login.sh` 重新登录，把**新的**凭证 JSON 覆盖到 Secrets。
@@ -245,7 +255,7 @@ TRAE 的积分由**多个独立到期的包**组成，`总计` 是它们的合�
    - fine-grained PAT：仓库权限勾选 **Secrets: Read and write**
    - 或 classic PAT：勾选 `repo`
 
-   配置后，每次签到结束会把刷新后的凭证写回 `TRAE_AUTH_1/2`，无需再手动更新。
+   配置后，**只有 token 实际刷新时**才会把新凭证写回 `TRAE_AUTH_1/2`；未刷新则跳过，避免无意义的 Secret 更新。
    不配置也能跑，但 refreshToken 轮换后 Secret 会失效，需要重新登录并手动覆盖。
 
 5. 仓库保活（已内置）
@@ -289,7 +299,7 @@ internal/
 
 login.sh                登录脚本（macOS/Linux/Git Bash，包装 cmd/login）
 login.ps1               登录脚本（Windows PowerShell，包装 cmd/login）
-signin.sh               签到脚本（含 Bark 通知）
+signin.sh               签到脚本（含 Server酱 / Bark 通知）
 crontab.txt             Crontab 配置参考
 auths/                  （gitignored）凭证文件
 ```
@@ -316,6 +326,7 @@ auths/                  （gitignored）凭证文件
 ## 致谢
 
 - [traework2api](https://github.com/Sliverkiss/traework2api) — 原项目，本工具的精简来源
+- [Server酱](https://sct.ftqq.com/) — 签到结果推送
 - [Bark](https://github.com/Finb/Bark) — iOS 通知推送工具
 
 ## License
