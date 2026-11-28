@@ -13,6 +13,15 @@ SERVERCHAN_API="${SERVERCHAN_API%/}"
 BARK_URL="${BARK_URL:-}"
 BARK_URL="${BARK_URL%/}"
 
+# 每天只成功签到一次：今日已成功后，兜底任务直接退出，
+# 不调用 TRAE 接口、也不发送通知，降低风控风险。
+AUTH_DIR="${1:-auths}"
+STATE_FILE="$AUTH_DIR/.signin-state"
+if [ "$(cat "$STATE_FILE" 2>/dev/null || true)" = "$(date +%F)" ]; then
+  echo "✅ 今日已成功签到（$(date +%F)），跳过本次执行：不调用 TRAE 接口，不发送通知"
+  exit 0
+fi
+
 # 对路径/正文做百分号编码（逐字节，兼容 UTF-8；Bark GET 接口需要）
 urlencode() {
   printf '%s' "$1" | od -An -tx1 | tr -d ' \n' | sed 's/../%&/g'
@@ -30,7 +39,7 @@ fi
 
 # 执行签到并捕获输出（签到程序退出码不影响后续通知）
 set +e
-SIGNIN_OUTPUT=$("$SIGNIN_BIN" "${1:-auths}" 2>&1)
+SIGNIN_OUTPUT=$("$SIGNIN_BIN" "$AUTH_DIR" 2>&1)
 SIGNIN_EXIT=$?
 set -e
 
@@ -62,6 +71,16 @@ while IFS= read -r line; do
         ACCOUNTS="${ACCOUNTS}${nick} ${status} 总${total}(签到${chk})"$'\n'
     fi
 done <<< "$SIGNIN_OUTPUT"
+
+# 今日签到成功则写入标记，后续兜底任务据此直接跳过（不再调用接口/发通知）。
+# 成功标准：无失败、无未确认、无设备异常，且至少有账号签到成功或今日已签。
+is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+if is_num "$FAIL" && is_num "$UNCONF" && is_num "$BUSY" && is_num "$OK" && is_num "$ALREADY" &&
+   [ "$FAIL" -eq 0 ] && [ "$UNCONF" -eq 0 ] && [ "$BUSY" -eq 0 ] &&
+   { [ "$OK" -gt 0 ] || [ "$ALREADY" -gt 0 ]; }; then
+  date +%F > "$STATE_FILE"
+  echo "📌 今日签到成功，已记录标记（后续兜底任务将跳过）"
+fi
 
 # 构建 Server酱 推送内容
 TITLE="TRAE 签到"

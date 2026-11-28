@@ -5,15 +5,49 @@ on:
     # GitHub cron 使用 UTC，且整点附近容易排队/延迟，这里错开 10 分钟。
     # 主签到：北京时间 08:10（UTC 00:10）
     # 兜底签到：北京时间 16:10（UTC 08:10）
+    # 主签到成功后，兜底任务会自动跳过（不调用接口、不发通知）。
     - cron: '10 0 * * *'
     - cron: '10 8 * * *'
-  workflow_dispatch: # 支持手动触发
+  workflow_dispatch: # 支持手动触发；手动触发不受“今日已成功”标记限制
 
 permissions:
   contents: read
 
 jobs:
+  check:
+    # 仅定时触发时检查今日是否已成功签到；手动触发直接执行
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.marker.outputs.cache-hit }}
+    steps:
+      - name: 计算今日日期
+        id: date
+        run: echo "today=$(TZ=Asia/Shanghai date +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: 查找今日成功标记
+        id: marker
+        uses: actions/cache/restore@v4
+        with:
+          path: .signin-ok
+          key: trae-signin-ok-${{ steps.date.outputs.today }}
+          lookup-only: true
+        # 缓存服务异常时按“未成功”处理，保证兜底仍会执行
+        continue-on-error: true
+
+      - name: 输出检查结果
+        run: |
+          if [ "${{ steps.marker.outputs.cache-hit }}" = "true" ]; then
+            echo "今日已成功签到，跳过兜底任务（不调用 TRAE 接口、不发送通知）"
+          else
+            echo "今日尚未成功签到，继续执行"
+          fi
+
   signin:
+    needs: check
+    if: |
+      github.event_name != 'schedule' ||
+      needs.check.outputs.skip != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
@@ -71,6 +105,41 @@ jobs:
           else
             echo "refreshed=0" >> $GITHUB_OUTPUT
           fi
+
+      - name: 判断本次是否成功
+        id: success
+        run: |
+          FAIL='${{ steps.result.outputs.fail }}'
+          UNCONF='${{ steps.result.outputs.unconf }}'
+          BUSY='${{ steps.result.outputs.busy }}'
+          OK='${{ steps.result.outputs.ok }}'
+          ALREADY='${{ steps.result.outputs.already }}'
+          is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+          if is_num "$FAIL" && is_num "$UNCONF" && is_num "$BUSY" && is_num "$OK" && is_num "$ALREADY" &&
+             [ "$FAIL" -eq 0 ] && [ "$UNCONF" -eq 0 ] && [ "$BUSY" -eq 0 ] &&
+             { [ "$OK" -gt 0 ] || [ "$ALREADY" -gt 0 ]; }; then
+            echo "success=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "success=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 计算今日日期
+        id: date
+        run: echo "today=$(TZ=Asia/Shanghai date +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: 记录今日成功标记
+        if: always() && steps.success.outputs.success == '1'
+        run: |
+          TZ=Asia/Shanghai date +%F > .signin-ok
+          echo "已记录今日成功标记：$(cat .signin-ok)"
+
+      - name: 保存今日成功标记
+        if: always() && steps.success.outputs.success == '1'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .signin-ok
+          key: trae-signin-ok-${{ steps.date.outputs.today }}
 
       - name: Server酱 / Bark 通知
         if: always()
