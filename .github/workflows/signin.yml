@@ -46,8 +46,9 @@ jobs:
   signin:
     needs: check
     if: |
-      github.event_name != 'schedule' ||
-      needs.check.outputs.skip != 'true'
+      always() &&
+      (github.event_name != 'schedule' ||
+       needs.check.outputs.skip != 'true')
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
